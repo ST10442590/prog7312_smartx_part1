@@ -126,4 +126,90 @@ app.MapGet("/api/mesh/summary", (DeviceRegistry registry) =>
 .WithName("GetMeshSummary")
 .WithSummary("Mesh-wide health counters.");
 
+// ------------------------------------------------------- attachments
+// Config files, deployment photos and hardware logs, attached to a sensor
+// profile. The stream is copied straight to disk rather than buffered into
+// memory, so a large hardware log does not cost a matching allocation on
+// the gateway.
+app.MapPost("/api/devices/{id}/attachments", async (
+    string id,
+    IFormFile file,
+    DeviceRegistry registry,
+    IWebHostEnvironment env) =>
+{
+    if (registry.GetProfile(id) is null)
+    {
+        return Results.NotFound(new { errors = new[] { $"Device '{id}' is not registered." } });
+    }
+
+    if (file is null || file.Length == 0)
+    {
+        return Results.BadRequest(new { errors = new[] { "No file was supplied." } });
+    }
+
+    const long maxBytes = 25 * 1024 * 1024;
+    if (file.Length > maxBytes)
+    {
+        return Results.BadRequest(new { errors = new[] { "Files are limited to 25 MB." } });
+    }
+
+    // Only the extensions a device profile legitimately needs.
+    string[] allowed = [".json", ".yaml", ".yml", ".txt", ".log", ".csv",
+                        ".cfg", ".ini", ".png", ".jpg", ".jpeg", ".webp"];
+
+    var extension = Path.GetExtension(file.FileName).ToLowerInvariant();
+    if (!allowed.Contains(extension))
+    {
+        return Results.BadRequest(new
+        {
+            errors = new[] { $"'{extension}' files are not accepted." }
+        });
+    }
+
+    var root = Path.Combine(env.ContentRootPath, "uploads", id);
+    Directory.CreateDirectory(root);
+
+    // The stored name is generated, never taken from the client. A filename
+    // like "../../appsettings.json" would otherwise escape the upload folder.
+    var storedName = $"{Guid.NewGuid():N}{extension}";
+    var storedPath = Path.Combine(root, storedName);
+
+    string hash;
+    await using (var destination = File.Create(storedPath))
+    {
+        await using var source = file.OpenReadStream();
+        await source.CopyToAsync(destination);
+
+        destination.Position = 0;
+        using var sha = System.Security.Cryptography.SHA256.Create();
+        hash = Convert.ToHexString(await sha.ComputeHashAsync(destination));
+    }
+
+    var attachment = new SensorAttachment
+    {
+        FileName = Path.GetFileName(file.FileName),
+        ContentType = file.ContentType,
+        SizeBytes = file.Length,
+        StoredPath = Path.Combine("uploads", id, storedName),
+        Sha256 = hash
+    };
+
+    return registry.TryAttach(id, attachment)
+        ? Results.Ok(attachment)
+        : Results.NotFound(new { errors = new[] { $"Device '{id}' is not registered." } });
+})
+.WithName("UploadAttachment")
+.WithSummary("Attaches a config file, photo or hardware log to a sensor profile.")
+.DisableAntiforgery();
+
+app.MapGet("/api/devices/{id}/attachments", (string id, DeviceRegistry registry) =>
+{
+    var profile = registry.GetProfile(id);
+    return profile is null
+        ? Results.NotFound()
+        : Results.Ok(profile.Attachments);
+})
+.WithName("GetAttachments")
+.WithSummary("Lists files attached to a sensor profile.");
+
 app.Run();
