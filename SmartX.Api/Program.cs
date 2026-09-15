@@ -7,6 +7,7 @@ var builder = WebApplication.CreateBuilder(args);
 // The registry is a singleton because it holds live mesh state shared by
 // every request and by the background simulator.
 builder.Services.AddSingleton<DeviceRegistry>();
+builder.Services.AddSingleton<TelemetryArchive>();
 builder.Services.AddScoped<TopologyBuilder>();
 builder.Services.AddHostedService<MeshSimulator>();
 
@@ -47,7 +48,8 @@ app.MapGet("/api/health", () => Results.Ok(new
 
 // ------------------------------------------------------------ ingestion
 // The primary receiver of telemetry. Accepts one packet from a node.
-app.MapPost("/api/telemetry", (TelemetryPacketDto dto, DeviceRegistry registry) =>
+app.MapPost("/api/telemetry", (
+    TelemetryPacketDto dto, DeviceRegistry registry, TelemetryArchive archive) =>
 {
     var errors = dto.Validate();
     if (errors.Count > 0)
@@ -55,35 +57,60 @@ app.MapPost("/api/telemetry", (TelemetryPacketDto dto, DeviceRegistry registry) 
         return Results.BadRequest(new { errors });
     }
 
-    var score = registry.Observe(dto.ToPacket());
+    var packet = dto.ToPacket();
+    var score = registry.Observe(packet);
 
     // A packet from an unregistered node is a configuration error, not a
     // silent no-op, so it gets a 404 rather than a 200.
-    return score is null
-        ? Results.NotFound(new { error = $"Device '{dto.DeviceId}' is not registered." })
-        : Results.Ok(new { dto.DeviceId, zScore = Math.Round(score.Value, 2) });
+    if (score is null)
+    {
+        return Results.NotFound(new { error = $"Device '{dto.DeviceId}' is not registered." });
+    }
+
+    archive.Ingest([packet], dto.Unit);
+
+    return Results.Ok(new { dto.DeviceId, zScore = Math.Round(score.Value, 2) });
 })
 .WithName("IngestTelemetry")
 .WithSummary("Receives a single telemetry packet from a sensor node.");
 
 // Batch endpoint: a gateway forwarding a buffered window of packets.
 app.MapPost("/api/telemetry/batch", (
-    TelemetryPacketDto[] packets, DeviceRegistry registry) =>
+    TelemetryPacketDto[] packets,
+    DeviceRegistry registry,
+    TelemetryArchive archive) =>
 {
-    var accepted = 0;
+    var accepted = new List<ITelemetryPacket>(packets.Length);
     var rejected = new List<string>();
 
     foreach (var dto in packets)
     {
-        if (dto.Validate().Count > 0 || registry.Observe(dto.ToPacket()) is null)
+        if (dto.Validate().Count > 0)
         {
             rejected.Add(dto.DeviceId);
             continue;
         }
-        accepted++;
+
+        var packet = dto.ToPacket();
+        if (registry.Observe(packet) is null)
+        {
+            rejected.Add(dto.DeviceId);
+            continue;
+        }
+
+        accepted.Add(packet);
     }
 
-    return Results.Ok(new { accepted, rejected });
+    // The whole accepted window is staged in one call, which is what the
+    // jagged buffer is designed for.
+    archive.Ingest(accepted, TelemetryUnit.None);
+
+    return Results.Ok(new
+    {
+        accepted = accepted.Count,
+        rejected,
+        stats = archive.Stats()
+    });
 })
 .WithName("IngestTelemetryBatch")
 .WithSummary("Receives a buffered batch of telemetry packets.");
@@ -249,5 +276,54 @@ app.MapGet("/api/topology/path/{deviceId}", (
 })
 .WithName("GetDevicePath")
 .WithSummary("Recursively resolves a device's ancestry path.");
+
+// ------------------------------------------------------ diagnostics
+// Evidence of what the pipeline actually did: how much arrived, how much
+// is staged in the jagged buffer, how much reached the List<T> archive.
+app.MapGet("/api/diagnostics/stats", (TelemetryArchive archive) =>
+    Results.Ok(archive.Stats()))
+.WithName("GetPipelineStats")
+.WithSummary("Ingestion and storage counters.");
+
+// Forces the staged jagged array to transfer into the List, so the drain
+// can be demonstrated on demand rather than waited for.
+app.MapPost("/api/diagnostics/flush", (TelemetryArchive archive) =>
+{
+    var moved = archive.Flush();
+    return Results.Ok(new { moved, stats = archive.Stats() });
+})
+.WithName("FlushArchive")
+.WithSummary("Drains staged batches into the historical archive.");
+
+app.MapGet("/api/diagnostics/search/value", (
+    TelemetryArchive archive,
+    string? deviceId, double min, double max) =>
+    Results.Ok(archive.SearchByValue(deviceId, min, max)))
+.WithName("SearchByValue")
+.WithSummary("Linear scan over historical readings.");
+
+app.MapGet("/api/diagnostics/search/time", (
+    TelemetryArchive archive, int secondsAgo) =>
+    Results.Ok(archive.SearchByTime(
+        DateTimeOffset.UtcNow.AddSeconds(-Math.Abs(secondsAgo)))))
+.WithName("SearchByTime")
+.WithSummary("Binary search over the time-ordered archive.");
+
+app.MapPost("/api/diagnostics/aggregate", (
+    TelemetryArchive archive, string[] deviceIds) =>
+    Results.Ok(archive.AggregateLoad(deviceIds)))
+.WithName("AggregateLoad")
+.WithSummary("Aggregates meters using the overloaded + operator.");
+
+app.MapGet("/api/diagnostics/delta", (
+    TelemetryArchive archive, string left, string right) =>
+    Results.Ok(archive.Delta(left, right)))
+.WithName("DeltaReadings")
+.WithSummary("Delta between two sensors using the overloaded - operator.");
+
+app.MapGet("/api/diagnostics/benchmark", () =>
+    Results.Ok(TelemetryArchive.Benchmark([1_000, 10_000, 50_000, 200_000])))
+.WithName("RunBenchmark")
+.WithSummary("Times insertion and search against growing volumes.");
 
 app.Run();

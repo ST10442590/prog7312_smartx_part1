@@ -20,6 +20,7 @@ namespace SmartX.Api.Services;
 public sealed class MeshSimulator : BackgroundService
 {
     private readonly DeviceRegistry _registry;
+    private readonly TelemetryArchive _archive;
     private readonly ILogger<MeshSimulator> _logger;
 
     // Seeded so every run produces the same sequence. A demo that behaves
@@ -37,9 +38,13 @@ public sealed class MeshSimulator : BackgroundService
     /// <summary>Chance per node per round of the node going silent.</summary>
     private const double DropoutChance = 0.002;
 
-    public MeshSimulator(DeviceRegistry registry, ILogger<MeshSimulator> logger)
+    public MeshSimulator(
+        DeviceRegistry registry,
+        TelemetryArchive archive,
+        ILogger<MeshSimulator> logger)
     {
         _registry = registry;
+        _archive = archive;
         _logger = logger;
     }
 
@@ -161,9 +166,15 @@ public sealed class MeshSimulator : BackgroundService
     private static string FormatMac(int index) =>
         $"5C:CF:7F:{index / 256 % 256:X2}:{index % 256:X2}:{(index * 7) % 256:X2}";
 
-    /// <summary>Publishes one reading from every node that is not silent.</summary>
+    /// <summary>
+    /// Publishes one round as a batch. Each node's packet is collected into
+    /// a list first, then transmitted in a single call — which is how a real
+    /// gateway forwards a buffered window rather than one packet at a time.
+    /// </summary>
     private void PublishRound()
     {
+        var batch = new List<ITelemetryPacket>(_nodes.Count);
+
         foreach (var node in _nodes)
         {
             // A node in a dropout window publishes nothing at all. The Pulse
@@ -176,27 +187,31 @@ public sealed class MeshSimulator : BackgroundService
 
             if (_random.NextDouble() < DropoutChance)
             {
-                // Silent for roughly 40 to 90 seconds.
                 node.SilentRounds = _random.Next(50, 110);
                 _logger.LogInformation("Node {Id} dropped out.", node.Profile.Id);
                 continue;
             }
 
-            var value = NextValue(node);
-
             var dto = new TelemetryPacketDto
             {
                 DeviceId = node.Profile.Id,
                 Kind = node.Kind,
-                Value = value,
+                Value = NextValue(node),
                 Category = node.Profile.Category,
                 Unit = node.Profile.Unit,
                 Sequence = ++node.Sequence,
                 CapturedAtUtc = DateTimeOffset.UtcNow
             };
 
-            _registry.Observe(dto.ToPacket());
+            var packet = dto.ToPacket();
+            batch.Add(packet);
+
+            // Live scoring for the Pulse Grid.
+            _registry.Observe(packet);
         }
+
+        // Batch transmission into the historical archive.
+        if (batch.Count > 0) _archive.Ingest(batch, TelemetryUnit.None);
     }
 
     private double NextValue(SimulatedNode node)
