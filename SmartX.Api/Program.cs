@@ -7,6 +7,7 @@ var builder = WebApplication.CreateBuilder(args);
 // The registry is a singleton because it holds live mesh state shared by
 // every request and by the background simulator.
 builder.Services.AddSingleton<DeviceRegistry>();
+builder.Services.AddScoped<TopologyBuilder>();
 builder.Services.AddHostedService<MeshSimulator>();
 
 builder.Services.AddOpenApi();
@@ -211,5 +212,42 @@ app.MapGet("/api/devices/{id}/attachments", (string id, DeviceRegistry registry)
 })
 .WithName("GetAttachments")
 .WithSummary("Lists files attached to a sensor profile.");
+
+// --------------------------------------------------------- topology
+// Exercises the recursive validator over the live mesh: tier ordering,
+// mains-power ancestry, cycles and depth are all checked by walking the
+// tree rather than by inspecting the flat device list.
+app.MapGet("/api/topology/validate", (TopologyBuilder topology) =>
+{
+    var report = topology.Validate();
+
+    return Results.Ok(new
+    {
+        report.IsValid,
+        report.ErrorCount,
+        report.WarningCount,
+        report.NodesVisited,
+        report.MaxDepthReached,
+        Issues = report.Issues
+    });
+})
+.WithName("ValidateTopology")
+.WithSummary("Recursively validates the deployment tree.");
+
+app.MapGet("/api/topology/tree", (TopologyBuilder topology) =>
+    Results.Ok(topology.Build()))
+.WithName("GetTopologyTree")
+.WithSummary("Returns the deployment tree assembled from registered devices.");
+
+app.MapGet("/api/topology/path/{deviceId}", (
+    string deviceId, TopologyBuilder topology) =>
+{
+    var path = topology.PathTo(deviceId);
+    return path is null
+        ? Results.NotFound(new { error = $"'{deviceId}' is not in the tree." })
+        : Results.Ok(new { deviceId, path });
+})
+.WithName("GetDevicePath")
+.WithSummary("Recursively resolves a device's ancestry path.");
 
 app.Run();
