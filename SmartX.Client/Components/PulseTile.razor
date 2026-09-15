@@ -1,0 +1,119 @@
+﻿@* One device tile. Three visual channels carry state at once: hue for
+   severity, a ring pulse for packet arrival, and opacity plus a counter
+   for silence. Severity is legible before any number is read. *@
+
+<div class="tile @StateClass @(IsPulsing ? "pulsing" : "")"
+     @onclick="() => OnSelect.InvokeAsync(Tile)"
+     role="button"
+     tabindex="0"
+     aria-label="@Tile.AriaSummary">
+
+    <div class="tile-head">
+        <span class="tile-name">@Tile.DisplayName</span>
+        <span class="tile-state">@StateLabel</span>
+    </div>
+    <div class="tile-zone">@Tile.LocationPath</div>
+
+    @* Sparkline: the trend context that tells a transient glitch apart
+       from genuine drift, without opening a separate chart. *@
+    <svg class="tile-spark" width="100%" height="28" viewBox="0 0 100 28"
+         preserveAspectRatio="none" aria-hidden="true">
+        @if (SparkPath is not null)
+        {
+            <polyline points="@SparkPath"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="1.2"
+                      stroke-linejoin="round"
+                      stroke-linecap="round"
+                      vector-effect="non-scaling-stroke" />
+        }
+    </svg>
+
+    <div class="tile-foot">
+        <span class="tile-value">@ValueLabel</span>
+        <span class="tile-value">@ScoreLabel</span>
+    </div>
+
+    @* The same state change, in words, for screen-reader users. *@
+    <span class="sr-only" aria-live="polite">@Tile.AriaSummary</span>
+</div>
+
+@code {
+    [Parameter, EditorRequired] public DeviceHealthDto Tile { get; set; } = default!;
+    [Parameter] public bool IsPulsing { get; set; }
+    [Parameter] public EventCallback<DeviceHealthDto> OnSelect { get; set; }
+
+    private string StateClass => Tile.State switch
+    {
+        HealthState.Spike => "spike",
+        HealthState.Drift => "drift",
+        HealthState.Disconnected => "offline",
+        _ => "nominal"
+    };
+
+    private string StateLabel => Tile.State switch
+    {
+        HealthState.Spike => "spike",
+        HealthState.Drift => "drift",
+        HealthState.Disconnected => "silent",
+        _ => "nominal"
+    };
+
+    private string ValueLabel => Tile.State == HealthState.Disconnected
+        ? $"{Tile.SilenceSeconds:0}s silent"
+        : $"{Tile.LastValue:0.##} {UnitSymbol}";
+
+    private string ScoreLabel => Tile.State == HealthState.Disconnected
+        ? "—"
+        : $"z {Tile.ZScore:+0.0;-0.0;0.0}";
+
+    private string UnitSymbol => Tile.Unit switch
+    {
+        TelemetryUnit.Celsius => "°C",
+        TelemetryUnit.Percent => "%",
+        TelemetryUnit.Watt => "W",
+        TelemetryUnit.KiloWattHour => "kWh",
+        TelemetryUnit.Lux => "lx",
+        TelemetryUnit.Boolean => "",
+        _ => ""
+    };
+
+    /// <summary>
+    /// Normalises the window to the 0-100 by 0-28 viewBox. Scaling to the
+    /// window's own min and max — rather than to a fixed range — means the
+    /// shape of the trend stays visible whatever the sensor measures.
+    /// </summary>
+    private string? SparkPath
+    {
+        get
+        {
+            var data = Tile.Sparkline;
+            if (data is null || data.Length < 2) return null;
+
+            var min = data.Min();
+            var max = data.Max();
+            var span = max - min;
+
+            // A perfectly flat window has no range to scale against; draw it
+            // down the middle rather than dividing by zero.
+            if (span < 1e-9)
+            {
+                return $"0,14 100,14";
+            }
+
+            var points = new string[data.Length];
+            for (var i = 0; i < data.Length; i++)
+            {
+                var x = i * 100.0 / (data.Length - 1);
+                // SVG y grows downward, so invert to put high values on top.
+                var y = 24 - ((data[i] - min) / span * 20);
+                points[i] = string.Create(
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    $"{x:0.##},{y:0.##}");
+            }
+
+            return string.Join(" ", points);
+        }
+    }
+}

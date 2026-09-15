@@ -1,7 +1,204 @@
 ﻿@page "/"
+@implements IDisposable
+@inject SmartXApiClient Api
 
-<PageTitle>Home</PageTitle>
+<PageTitle>Smart-X — Sensor Data Ingestion</PageTitle>
 
-<h1>Hello, world!</h1>
+<div class="page-head">
+    <div>
+        <h1>Sensor Data Ingestion and Telemetry</h1>
+        <p class="page-sub">
+            Live mesh health. Hue encodes deviation from each node's own
+            baseline, so severity is visible before any value is read.
+        </p>
+    </div>
 
-Welcome to your new app.
+    <span class="link-state">
+        <span class="link-dot @(_online ? "online" : "")"></span>
+        @(_online ? "Gateway online" : "Gateway unreachable")
+    </span>
+</div>
+
+@if (!_online && _loaded)
+{
+    <div class="alert bad">
+        The gateway is not responding. Start the API with
+        <code>dotnet run --project SmartX.Api</code> and this view will
+        reconnect on its own.
+    </div>
+}
+
+<div class="stat-row">
+    <div class="stat">
+        <div class="stat-label">Devices</div>
+        <div class="stat-value">@(_summary?.TotalDevices ?? 0)</div>
+    </div>
+    <div class="stat is-nominal">
+        <div class="stat-label">Nominal</div>
+        <div class="stat-value">@(_summary?.Nominal ?? 0)</div>
+    </div>
+    <div class="stat is-drift">
+        <div class="stat-label">Drift</div>
+        <div class="stat-value">@(_summary?.Drift ?? 0)</div>
+    </div>
+    <div class="stat is-spike">
+        <div class="stat-label">Spike</div>
+        <div class="stat-value">@(_summary?.Spike ?? 0)</div>
+    </div>
+    <div class="stat is-offline">
+        <div class="stat-label">Silent</div>
+        <div class="stat-value">@(_summary?.Disconnected ?? 0)</div>
+    </div>
+    <div class="stat">
+        <div class="stat-label">Packets</div>
+        <div class="stat-value">@(_summary?.TotalPackets.ToString("N0") ?? "0")</div>
+    </div>
+</div>
+
+@if (!_loaded)
+{
+    <div class="empty">Connecting to the gateway…</div>
+}
+else if (_tiles.Count == 0)
+{
+    <div class="empty">No devices are registered.</div>
+}
+else
+{
+    <div class="pulse-grid">
+        @foreach (var tile in _tiles)
+        {
+            <PulseTile Tile="tile"
+                       IsPulsing="@_pulsing.Contains(tile.DeviceId)"
+                       OnSelect="Select"
+                       @key="tile.DeviceId" />
+        }
+    </div>
+
+    <div class="legend">
+        <span class="legend-item">
+            <span class="legend-swatch nominal"></span> Nominal &nbsp;|z| &lt; 1.5
+        </span>
+        <span class="legend-item">
+            <span class="legend-swatch drift"></span> Drift &nbsp;1.5 ≤ |z| &lt; 3
+        </span>
+        <span class="legend-item">
+            <span class="legend-swatch spike"></span> Spike &nbsp;|z| ≥ 3
+        </span>
+        <span class="legend-item">
+            <span class="legend-swatch offline"></span> Disconnected — no heartbeat
+        </span>
+    </div>
+}
+
+@if (_selected is not null)
+{
+    <div class="card" style="margin-top:1.25rem;">
+        <div class="page-head" style="margin-bottom:0.75rem;">
+            <h2>@_selected.DisplayName</h2>
+            <button class="ghost" @onclick="() => _selected = null">Close</button>
+        </div>
+        <table>
+            <tbody>
+                <tr><th>Location</th><td>@_selected.LocationPath</td></tr>
+                <tr><th>Category</th><td>@_selected.Category</td></tr>
+                <tr><th>State</th><td>@_selected.State</td></tr>
+                <tr><th>Deviation</th><td>@_selected.ZScore.ToString("+0.00;-0.00;0.00") σ</td></tr>
+                <tr><th>Last value</th><td>@_selected.LastValue @_selected.Unit</td></tr>
+                <tr><th>Packets seen</th><td>@_selected.PacketsSeen.ToString("N0")</td></tr>
+                <tr><th>Silent for</th><td>@_selected.SilenceSeconds.ToString("0.0") s</td></tr>
+            </tbody>
+        </table>
+    </div>
+}
+
+@code {
+    private readonly List<DeviceHealthDto> _tiles = [];
+    private readonly HashSet<string> _pulsing = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, long> _lastPacketCounts =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    private MeshSummaryDto? _summary;
+    private DeviceHealthDto? _selected;
+    private bool _online;
+    private bool _loaded;
+
+    private CancellationTokenSource? _cts;
+    private PeriodicTimer? _timer;
+
+    /// <summary>Poll interval. Fast enough to feel live, slow enough to be cheap.</summary>
+    private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(900);
+
+    protected override async Task OnInitializedAsync()
+    {
+        _cts = new CancellationTokenSource();
+        await RefreshAsync();
+        _loaded = true;
+
+        _timer = new PeriodicTimer(PollInterval);
+        _ = PollLoopAsync(_cts.Token);
+    }
+
+    private async Task PollLoopAsync(CancellationToken ct)
+    {
+        try
+        {
+            while (_timer is not null && await _timer.WaitForNextTickAsync(ct))
+            {
+                await RefreshAsync();
+                await InvokeAsync(StateHasChanged);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // The component was disposed; nothing to do.
+        }
+    }
+
+    private async Task RefreshAsync()
+    {
+        var ct = _cts?.Token ?? CancellationToken.None;
+
+        var summary = await Api.GetMeshSummaryAsync(ct);
+        var tiles = await Api.GetMeshHealthAsync(ct);
+
+        _online = summary is not null;
+        _summary = summary ?? _summary;
+
+        if (tiles.Count == 0 && !_online) return;
+
+        // Work out which tiles received a packet since the last poll. The
+        // ring pulse fires only on those, so arrival is felt as motion
+        // rather than having to be read off a counter.
+        _pulsing.Clear();
+        foreach (var tile in tiles)
+        {
+            if (_lastPacketCounts.TryGetValue(tile.DeviceId, out var previous) &&
+                tile.PacketsSeen > previous)
+            {
+                _pulsing.Add(tile.DeviceId);
+            }
+            _lastPacketCounts[tile.DeviceId] = tile.PacketsSeen;
+        }
+
+        _tiles.Clear();
+        _tiles.AddRange(tiles);
+
+        // Keep the detail panel in step with the live data.
+        if (_selected is not null)
+        {
+            _selected = tiles.FirstOrDefault(t =>
+                string.Equals(t.DeviceId, _selected.DeviceId,
+                    StringComparison.OrdinalIgnoreCase)) ?? _selected;
+        }
+    }
+
+    private void Select(DeviceHealthDto tile) => _selected = tile;
+
+    public void Dispose()
+    {
+        _cts?.Cancel();
+        _timer?.Dispose();
+        _cts?.Dispose();
+    }
+}

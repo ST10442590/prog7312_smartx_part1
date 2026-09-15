@@ -1,39 +1,32 @@
-﻿<div class="top-row ps-3 navbar navbar-dark">
-    <div class="container-fluid">
-        <a class="navbar-brand" href="">SmartX.Client</a>
-        <button title="Navigation menu" class="navbar-toggler" @onclick="ToggleNavMenu">
-            <span class="navbar-toggler-icon"></span>
-        </button>
+﻿@inject NavigationManager Nav
+
+<nav class="sidebar">
+    <div class="brand">
+        <div class="brand-name">Smart-X</div>
+        <div class="brand-sub">Ingestion Gateway</div>
     </div>
-</div>
 
-<div class="@NavMenuCssClass nav-scrollable" @onclick="ToggleNavMenu">
-    <nav class="nav flex-column">
-        <div class="nav-item px-3">
-            <NavLink class="nav-link" href="" Match="NavLinkMatch.All">
-                <span class="bi bi-house-door-fill-nav-menu" aria-hidden="true"></span> Home
-            </NavLink>
+    <div class="nav-list">
+        @* Pillar one — implemented in this part. *@
+        <NavLink class="nav-item" href="" Match="NavLinkMatch.All">
+            <span>Sensor Data Ingestion</span>
+        </NavLink>
+
+        <NavLink class="nav-item" href="devices">
+            <span>Sensor Registry</span>
+        </NavLink>
+
+        @* Pillars two and three are deliberately visible but disabled, so the
+           architecture is legible from the first screen rather than appearing
+           later without context. *@
+        <div class="nav-item disabled" title="Planned for Part 2">
+            <span>Command Stream</span>
+            <span class="nav-badge">Part 2</span>
         </div>
-        <div class="nav-item px-3">
-            <NavLink class="nav-link" href="counter">
-                <span class="bi bi-plus-square-fill-nav-menu" aria-hidden="true"></span> Counter
-            </NavLink>
+
+        <div class="nav-item disabled" title="Planned for the final PoE">
+            <span>Mesh Topology</span>
+            <span class="nav-badge">PoE</span>
         </div>
-        <div class="nav-item px-3">
-            <NavLink class="nav-link" href="weather">
-                <span class="bi bi-list-nested-nav-menu" aria-hidden="true"></span> Weather
-            </NavLink>
-        </div>
-    </nav>
-</div>
-
-@code {
-    private bool collapseNavMenu = true;
-
-    private string? NavMenuCssClass => collapseNavMenu ? "collapse" : null;
-
-    private void ToggleNavMenu()
-    {
-        collapseNavMenu = !collapseNavMenu;
-    }
-}
+    </div>
+</nav>
