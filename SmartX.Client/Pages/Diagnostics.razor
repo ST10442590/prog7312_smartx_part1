@@ -1,0 +1,477 @@
+﻿@page "/diagnostics"
+@implements IDisposable
+@inject SmartXApiClient Api
+
+<PageTitle>Smart-X — Pipeline Diagnostics</PageTitle>
+
+<div class="page-head">
+    <div>
+        <h1>Pipeline Diagnostics</h1>
+        <p class="page-sub">
+            Evidence of what happens inside the gateway: batch generation,
+            transmission, staging in the jagged buffer, transfer into the
+            List archive, and timed retrieval.
+        </p>
+    </div>
+</div>
+
+@* ---------------------------------------------------- pipeline counters *@
+<div class="stat-row">
+    <div class="stat">
+        <div class="stat-label">Received</div>
+        <div class="stat-value">@(_stats?.Received.ToString("N0") ?? "0")</div>
+    </div>
+    <div class="stat">
+        <div class="stat-label">Staged (jagged)</div>
+        <div class="stat-value">@(_stats?.StagedReadings.ToString("N0") ?? "0")</div>
+    </div>
+    <div class="stat is-nominal">
+        <div class="stat-label">Stored (List&lt;T&gt;)</div>
+        <div class="stat-value">@(_stats?.Stored.ToString("N0") ?? "0")</div>
+    </div>
+    <div class="stat">
+        <div class="stat-label">List capacity</div>
+        <div class="stat-value">@(_stats?.ArchiveCapacity.ToString("N0") ?? "0")</div>
+    </div>
+    <div class="stat">
+        <div class="stat-label">Last drain</div>
+        <div class="stat-value">@(_stats?.LastDrainMs.ToString("0.###") ?? "0") ms</div>
+    </div>
+    <div class="stat">
+        <div class="stat-label">Drain rate /s</div>
+        <div class="stat-value">@(_stats?.LastDrainThroughput.ToString("N0") ?? "0")</div>
+    </div>
+</div>
+
+<div class="card">
+    <h2>Storage pipeline</h2>
+    <p class="page-sub">
+        Batches arrive and are staged in <code>double[][]</code> — one row per
+        batch, each sized to that batch exactly. When the staging area fills,
+        the whole thing transfers into a <code>List&lt;SensorReading&gt;</code>
+        grown once to the required capacity, so the list never reallocates
+        mid-transfer. Staged @(_stats?.StagedBatches ?? 0) batch(es) right now;
+        window spans @(_stats?.OldestUtc ?? "—") to @(_stats?.NewestUtc ?? "—").
+    </p>
+    <button class="ghost" @onclick="FlushAsync" disabled="@_busy">
+        Force drain now
+    </button>
+</div>
+
+@* -------------------------------------------------- batch transmission *@
+<div class="card">
+    <h2>Generate and transmit a batch</h2>
+    <p class="page-sub">
+        Builds packets client-side and posts them to
+        <code>/api/telemetry/batch</code> in one request. Each is a
+        <code>TelemetryPacket&lt;T&gt;</code> closed over float, int or bool
+        at the API boundary.
+    </p>
+
+    <div class="form-grid">
+        <div class="field">
+            <label for="batch-size">Packets in batch</label>
+            <select id="batch-size" @bind="_batchSize">
+                <option value="10">10</option>
+                <option value="50">50</option>
+                <option value="250">250</option>
+                <option value="1000">1000</option>
+            </select>
+        </div>
+        <div class="field">
+            <label for="batch-device">Source device</label>
+            <select id="batch-device" @bind="_batchDeviceId">
+                @foreach (var profile in _profiles)
+                {
+                    <option value="@profile.Id">@profile.DisplayName (@profile.Unit)</option>
+                }
+            </select>
+        </div>
+    </div>
+
+    <button @onclick="SendBatchAsync" disabled="@(_busy || _profiles.Count == 0)">
+        @(_busy ? "Transmitting…" : "Generate and transmit")
+    </button>
+
+    @if (_batchResult is not null)
+    {
+        <div class="alert ok" style="margin-top:1rem;">
+            Transmitted @_lastBatchSize packets —
+            @_batchResult.Accepted accepted,
+            @_batchResult.Rejected.Count rejected.
+            Archive now holds @(_batchResult.Stats?.Stored.ToString("N0") ?? "?") readings.
+        </div>
+    }
+</div>
+
+@* ------------------------------------------------- operator overloading *@
+<div class="card">
+    <h2>Aggregation with overloaded operators</h2>
+    <p class="page-sub">
+        These panels call the <code>+</code> and <code>-</code> operators
+        defined on <code>SensorReading</code>. Aggregation folds the latest
+        reading from each selected meter with <code>total = total + next</code>;
+        the delta uses <code>left - right</code> and compares with
+        <code>&gt;</code>.
+    </p>
+
+    <div class="form-grid">
+        <div class="field">
+            <label for="agg">Meters to aggregate (ctrl-click for several)</label>
+            <select id="agg" multiple size="5" @onchange="OnAggregationSelected">
+                @foreach (var profile in _powerMeters)
+                {
+                    <option value="@profile.Id">@profile.DisplayName — @profile.Unit</option>
+                }
+            </select>
+            <div class="field-hint">
+                Pick meters sharing a unit. Mixed units are refused by design.
+            </div>
+        </div>
+
+        <div class="field">
+            <label for="delta-left">Delta: left operand</label>
+            <select id="delta-left" @bind="_deltaLeft">
+                @foreach (var profile in _profiles)
+                {
+                    <option value="@profile.Id">@profile.DisplayName</option>
+                }
+            </select>
+
+            <label for="delta-right" style="margin-top:0.6rem;">Right operand</label>
+            <select id="delta-right" @bind="_deltaRight">
+                @foreach (var profile in _profiles)
+                {
+                    <option value="@profile.Id">@profile.DisplayName</option>
+                }
+            </select>
+        </div>
+    </div>
+
+    <button @onclick="AggregateAsync" disabled="@_busy">Aggregate (+)</button>
+    <button class="ghost" @onclick="DeltaAsync" disabled="@_busy">Delta (−)</button>
+
+    @if (_aggregation is not null)
+    {
+        <div class="alert @(_aggregation.Error is null ? "ok" : "bad")" style="margin-top:1rem;">
+            @if (_aggregation.Error is not null)
+            {
+                <span>@_aggregation.Error</span>
+            }
+            else
+            {
+                <span>
+                    <strong>@_aggregation.Operation</strong> —
+                    <code>@_aggregation.Expression</code>
+                </span>
+            }
+        </div>
+
+        @if (_aggregation.Error is null)
+        {
+            <table>
+                <tbody>
+                    <tr><th>Result</th><td>@_aggregation.Result @_aggregation.Unit</td></tr>
+                    <tr><th>Source count</th><td>@_aggregation.SourceCount</td></tr>
+                    <tr><th>Mean per sensor</th><td>@_aggregation.Mean @_aggregation.Unit</td></tr>
+                </tbody>
+            </table>
+
+            <h3 style="margin-top:1rem;">Inputs</h3>
+            <table>
+                <thead>
+                    <tr><th>Device</th><th>Value</th><th>Captured</th></tr>
+                </thead>
+                <tbody>
+                    @foreach (var input in _aggregation.Inputs)
+                    {
+                        <tr>
+                            <td>@input.DeviceId</td>
+                            <td>@input.Value @input.Unit</td>
+                            <td>@input.TimestampUtc.ToString("HH:mm:ss.fff")</td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        }
+    }
+</div>
+
+@* -------------------------------------------------------------- search *@
+<div class="card">
+    <h2>Search historical telemetry</h2>
+    <p class="page-sub">
+        Two algorithms over the same archive. The linear scan examines every
+        record; the binary search exploits the fact that readings are stored
+        in time order.
+    </p>
+
+    <div class="form-grid">
+        <div class="field">
+            <label for="search-device">Device (blank for all)</label>
+            <select id="search-device" @bind="_searchDeviceId">
+                <option value="">Any device</option>
+                @foreach (var profile in _profiles)
+                {
+                    <option value="@profile.Id">@profile.DisplayName</option>
+                }
+            </select>
+        </div>
+        <div class="field">
+            <label for="search-min">Minimum value</label>
+            <input id="search-min" type="number" step="any" @bind="_searchMin" />
+        </div>
+        <div class="field">
+            <label for="search-max">Maximum value</label>
+            <input id="search-max" type="number" step="any" @bind="_searchMax" />
+        </div>
+        <div class="field">
+            <label for="search-seconds">Binary search: seconds ago</label>
+            <input id="search-seconds" type="number" @bind="_secondsAgo" />
+        </div>
+    </div>
+
+    <button @onclick="SearchByValueAsync" disabled="@_busy">Linear scan</button>
+    <button class="ghost" @onclick="SearchByTimeAsync" disabled="@_busy">Binary search</button>
+
+    @if (_search is not null)
+    {
+        <table style="margin-top:1rem;">
+            <tbody>
+                <tr><th>Algorithm</th><td>@_search.Algorithm</td></tr>
+                <tr><th>Query</th><td>@_search.Query</td></tr>
+                <tr><th>Records searched</th><td>@_search.RecordsSearched.ToString("N0")</td></tr>
+                <tr><th>Comparisons</th><td>@_search.Comparisons.ToString("N0")</td></tr>
+                <tr><th>Matches</th><td>@_search.MatchCount.ToString("N0")</td></tr>
+                <tr><th>Elapsed</th><td>@_search.ElapsedMs ms</td></tr>
+            </tbody>
+        </table>
+
+        @if (_search.Sample.Count > 0)
+        {
+            <h3 style="margin-top:1rem;">Sample of matches</h3>
+            <table>
+                <thead>
+                    <tr><th>Device</th><th>Value</th><th>Captured</th></tr>
+                </thead>
+                <tbody>
+                    @foreach (var row in _search.Sample)
+                    {
+                        <tr>
+                            <td>@row.DeviceId</td>
+                            <td>@row.Value</td>
+                            <td>@row.TimestampUtc.ToString("HH:mm:ss.fff")</td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        }
+    }
+</div>
+
+@* ----------------------------------------------------------- benchmark *@
+<div class="card">
+    <h2>Performance as telemetry size increases</h2>
+    <p class="page-sub">
+        Inserts and searches 1,000 through 200,000 records on a private
+        archive, so the live mesh is untouched. Takes a few seconds.
+    </p>
+
+    <button @onclick="BenchmarkAsync" disabled="@_benchmarking">
+        @(_benchmarking ? "Running…" : "Run performance test")
+    </button>
+
+    @if (_benchmark is not null)
+    {
+        <table style="margin-top:1rem;">
+            <thead>
+                <tr>
+                    <th>Records</th>
+                    <th>Insert (ms)</th>
+                    <th>Insert /s</th>
+                    <th>Linear O(n)</th>
+                    <th>Binary O(log n)</th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var row in _benchmark.Rows)
+                {
+                    <tr>
+                        <td>@row.Records.ToString("N0")</td>
+                        <td>@row.InsertMs</td>
+                        <td>@row.InsertThroughput.ToString("N0")</td>
+                        <td>@row.LinearSearchMs ms</td>
+                        <td>@row.BinarySearchMs ms</td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+        <p class="page-sub" style="margin-top:0.75rem;">
+            @_benchmark.Notes The first row runs slower than the second
+            because the methods are still being JIT-compiled on the first pass.
+        </p>
+    }
+</div>
+
+@code {
+    private List<SensorProfile> _profiles = [];
+    private List<SensorProfile> _powerMeters = [];
+
+    private PipelineStatsDto? _stats;
+    private BatchResultDto? _batchResult;
+    private AggregationDto? _aggregation;
+    private SearchResultDto? _search;
+    private BenchmarkResultDto? _benchmark;
+
+    private string[] _aggregationIds = [];
+    private string _deltaLeft = string.Empty;
+    private string _deltaRight = string.Empty;
+    private string _batchDeviceId = string.Empty;
+    private string _searchDeviceId = string.Empty;
+
+    private int _batchSize = 50;
+    private int _lastBatchSize;
+    private int _secondsAgo = 30;
+    private double _searchMin = 20;
+    private double _searchMax = 25;
+
+    private bool _busy;
+    private bool _benchmarking;
+
+    private CancellationTokenSource? _cts;
+    private PeriodicTimer? _timer;
+
+    protected override async Task OnInitializedAsync()
+    {
+        _cts = new CancellationTokenSource();
+
+        var profiles = await Api.GetDevicesAsync();
+        _profiles = profiles.OrderBy(p => p.DisplayName).ToList();
+        _powerMeters = _profiles
+            .Where(p => p.Category == SensorCategory.PowerConsumption)
+            .ToList();
+
+        _batchDeviceId = _profiles.FirstOrDefault()?.Id ?? string.Empty;
+        _deltaLeft = _profiles.FirstOrDefault()?.Id ?? string.Empty;
+        _deltaRight = _profiles.Skip(1).FirstOrDefault()?.Id ?? string.Empty;
+
+        _stats = await Api.GetStatsAsync();
+
+        _timer = new PeriodicTimer(TimeSpan.FromSeconds(2));
+        _ = PollAsync(_cts.Token);
+    }
+
+    private async Task PollAsync(CancellationToken ct)
+    {
+        try
+        {
+            while (_timer is not null && await _timer.WaitForNextTickAsync(ct))
+            {
+                _stats = await Api.GetStatsAsync(ct);
+                await InvokeAsync(StateHasChanged);
+            }
+        }
+        catch (Exception ex) when (ex is OperationCanceledException or ObjectDisposedException)
+        {
+            // Component disposed mid-poll during navigation. Expected.
+        }
+    }
+
+    private async Task FlushAsync()
+    {
+        _busy = true;
+        _stats = await Api.FlushAsync() ?? _stats;
+        _busy = false;
+    }
+
+    /// <summary>
+    /// Builds a batch client-side and transmits it in one request. Values
+    /// walk a small sine so the batch is not a flat line in the archive.
+    /// </summary>
+    private async Task SendBatchAsync()
+    {
+        if (string.IsNullOrWhiteSpace(_batchDeviceId)) return;
+
+        _busy = true;
+        _batchResult = null;
+
+        var profile = _profiles.First(p => p.Id == _batchDeviceId);
+        var kind = profile.Unit switch
+        {
+            TelemetryUnit.Boolean => PayloadKind.Boolean,
+            TelemetryUnit.Watt => PayloadKind.Integer,
+            _ => PayloadKind.Float
+        };
+
+        var packets = new List<TelemetryPacketDto>(_batchSize);
+        var now = DateTimeOffset.UtcNow;
+
+        for (var i = 0; i < _batchSize; i++)
+        {
+            packets.Add(new TelemetryPacketDto
+            {
+                DeviceId = profile.Id,
+                Kind = kind,
+                Value = kind == PayloadKind.Boolean
+                    ? (i % 7 == 0 ? 0 : 1)
+                    : 21.5 + Math.Sin(i / 4.0) * 1.5,
+                Category = profile.Category,
+                Unit = profile.Unit,
+                Sequence = i,
+                CapturedAtUtc = now.AddMilliseconds(i)
+            });
+        }
+
+        _lastBatchSize = packets.Count;
+        _batchResult = await Api.SendBatchAsync(packets);
+        _stats = _batchResult?.Stats ?? _stats;
+        _busy = false;
+    }
+
+    private void OnAggregationSelected(ChangeEventArgs e)
+    {
+        _aggregationIds = e.Value is string[] values ? values : [];
+    }
+
+    private async Task AggregateAsync()
+    {
+        _busy = true;
+        _aggregation = await Api.AggregateAsync(_aggregationIds);
+        _busy = false;
+    }
+
+    private async Task DeltaAsync()
+    {
+        _busy = true;
+        _aggregation = await Api.DeltaAsync(_deltaLeft, _deltaRight);
+        _busy = false;
+    }
+
+    private async Task SearchByValueAsync()
+    {
+        _busy = true;
+        _search = await Api.SearchByValueAsync(_searchDeviceId, _searchMin, _searchMax);
+        _busy = false;
+    }
+
+    private async Task SearchByTimeAsync()
+    {
+        _busy = true;
+        _search = await Api.SearchByTimeAsync(_secondsAgo);
+        _busy = false;
+    }
+
+    private async Task BenchmarkAsync()
+    {
+        _benchmarking = true;
+        _benchmark = await Api.BenchmarkAsync();
+        _benchmarking = false;
+    }
+
+    public void Dispose()
+    {
+        _cts?.Cancel();
+        _timer?.Dispose();
+        _cts?.Dispose();
+    }
+}

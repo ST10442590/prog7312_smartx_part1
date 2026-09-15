@@ -190,9 +190,154 @@ public sealed class SmartXApiClient
         }
     }
 
+    // ------------------------------------------------------ diagnostics
+    /// <summary>Pipeline counters: received, staged, stored.</summary>
+    public async Task<PipelineStatsDto?> GetStatsAsync(CancellationToken ct = default)
+    {
+        try
+        {
+            return await _http.GetFromJsonAsync<PipelineStatsDto>(
+                "/api/diagnostics/stats", ct);
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>Forces staged batches to drain into the archive.</summary>
+    public async Task<PipelineStatsDto?> FlushAsync(CancellationToken ct = default)
+    {
+        try
+        {
+            using var response = await _http.PostAsync("/api/diagnostics/flush", null, ct);
+            if (!response.IsSuccessStatusCode) return null;
+
+            var payload = await response.Content
+                .ReadFromJsonAsync<FlushPayload>(cancellationToken: ct);
+            return payload?.Stats;
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>Linear scan over historical readings.</summary>
+    public async Task<SearchResultDto?> SearchByValueAsync(
+        string? deviceId, double min, double max, CancellationToken ct = default)
+    {
+        var query = $"/api/diagnostics/search/value?min={min}&max={max}";
+        if (!string.IsNullOrWhiteSpace(deviceId))
+        {
+            query += $"&deviceId={Uri.EscapeDataString(deviceId)}";
+        }
+
+        try
+        {
+            return await _http.GetFromJsonAsync<SearchResultDto>(query, ct);
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>Binary search over the time-ordered archive.</summary>
+    public async Task<SearchResultDto?> SearchByTimeAsync(
+        int secondsAgo, CancellationToken ct = default)
+    {
+        try
+        {
+            return await _http.GetFromJsonAsync<SearchResultDto>(
+                $"/api/diagnostics/search/time?secondsAgo={secondsAgo}", ct);
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>Aggregates meters using the overloaded + operator.</summary>
+    public async Task<AggregationDto?> AggregateAsync(
+        IReadOnlyList<string> deviceIds, CancellationToken ct = default)
+    {
+        try
+        {
+            using var response = await _http.PostAsJsonAsync(
+                "/api/diagnostics/aggregate", deviceIds, ct);
+
+            return response.IsSuccessStatusCode
+                ? await response.Content.ReadFromJsonAsync<AggregationDto>(cancellationToken: ct)
+                : null;
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>Delta between two sensors using the overloaded - operator.</summary>
+    public async Task<AggregationDto?> DeltaAsync(
+        string left, string right, CancellationToken ct = default)
+    {
+        try
+        {
+            return await _http.GetFromJsonAsync<AggregationDto>(
+                $"/api/diagnostics/delta?left={Uri.EscapeDataString(left)}" +
+                $"&right={Uri.EscapeDataString(right)}", ct);
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Runs the performance harness. Slow by design — it inserts 200,000
+    /// records — so the caller should show a busy state.
+    /// </summary>
+    public async Task<BenchmarkResultDto?> BenchmarkAsync(CancellationToken ct = default)
+    {
+        try
+        {
+            return await _http.GetFromJsonAsync<BenchmarkResultDto>(
+                "/api/diagnostics/benchmark", ct);
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>Transmits a generated batch through the ingestion endpoint.</summary>
+    public async Task<BatchResultDto?> SendBatchAsync(
+        IReadOnlyList<TelemetryPacketDto> packets, CancellationToken ct = default)
+    {
+        try
+        {
+            using var response = await _http.PostAsJsonAsync(
+                "/api/telemetry/batch", packets, ct);
+
+            return response.IsSuccessStatusCode
+                ? await response.Content.ReadFromJsonAsync<BatchResultDto>(cancellationToken: ct)
+                : null;
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+        {
+            return null;
+        }
+    }
+
     private sealed class ErrorPayload
     {
         public List<string>? Errors { get; set; }
+    }
+
+    private sealed class FlushPayload
+    {
+        public int Moved { get; set; }
+        public PipelineStatsDto? Stats { get; set; }
     }
 }
 
@@ -208,4 +353,12 @@ public sealed class ApiResult
 
     public static ApiResult Fail(IReadOnlyList<string> errors) =>
         new() { Succeeded = false, Errors = errors };
+}
+
+/// <summary>What the batch ingestion endpoint returns.</summary>
+public sealed class BatchResultDto
+{
+    public int Accepted { get; set; }
+    public List<string> Rejected { get; set; } = [];
+    public PipelineStatsDto? Stats { get; set; }
 }
